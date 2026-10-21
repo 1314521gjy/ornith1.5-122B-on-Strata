@@ -22,6 +22,14 @@
                          -Profile .\profile\expert-profile-ornith122b.txt -Tokenizer .\tokenizer
 ```
 
+## 📦 预编译引擎（可选）
+
+`bin/strata-poly.exe` —— **62.62 MB** / sha256 `03885B2402A4CAB3…` / Windows x64 + CUDA 13.3 + sm_89。
+
+- **DLL 不随仓库分发**（`cublasLt64_13.dll` 有 438 MB），装 **CUDA 13.3 Runtime** 即可；DLL 在 `<cuda>\bin\x64`，**不在** `<cuda>\bin`
+- **别人的机器上更推荐自己编**（76 秒，16 线程），见 [`bin/README.md`](bin/README.md) 与 [`DEPLOY.md`](DEPLOY.md) §3
+- 硬要求：**显存 ≥32 GB**（24 GB 跑不了）、RAM ≥64 GiB、sm_89
+
 ## 收益从哪来（三块，**全部零改码**）
 
 | # | 改动 | 收益 |
@@ -82,3 +90,14 @@ benchmark/intel-test.md  智力测试（28 题 / 32 请求）逐题明细
 - **prefill 只认 `reused=0`**：引擎每 4,096 token 存检查点，只改 prompt 末尾会走"4096 前缀 + 尾"混合路径 ⇒ 报出 2 倍假高。
 - **decode 必须用长答案**：5~7 token 的短答案会把固定开销摊在极短窗口上 ⇒ 系统性低估 30~40%。
 - **判否必须带条件**：同一个 `--prompt-batch 4096` 在旧条件下是 −3.03%，条件全变后（新 exe + pin + RING2=0）变成 **+41.8%** —— 条件变了，判否就失效。
+
+## ⚠️ 已知问题（接入真实应用后才暴露的）
+
+| 问题 | 表现 | 真相 |
+|---|---|---|
+| **`thinking` 无上限** | 一问要等几分钟 | **`max_tokens` 是 thinking 的预算**（`usage` 里 thinking 计入 `completion`、无 `reasoning_tokens` 字段）。给 65536 会让它思考 **30 分钟**；**建议 4096–8192**。给 1024 会出现 content 0 字 + `finish=length` |
+| **`--prompt-cache-every 0` 让多轮变慢** | 每问一句都全量 prefill 30K（**18 s**） | 那是**单轮** +41.8% 的代价。**多轮/agent 场景必须用 `2048`**（第 2 轮起 **0.38 s**） |
+| **长上下文明显慢** | 128K 时 TTFT **128 s**、decode **19.5**（8K 时 2.11 s / 45.3） | KV **按需增长** ⇒ **不挤专家缓存（5,544 未缩）、不 OOM**，只是 attention 本身贵 |
+| **身份污染** | 问"你是谁"答 Anthropic / GLM | 模型权重里的训练数据污染，**修不了**；**不影响技术能力**（算数 15/15、工具 3/4、SVG 四条全过） |
+
+详见 [`benchmark/multiturn-and-context.md`](benchmark/multiturn-and-context.md)。
