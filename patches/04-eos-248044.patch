@@ -1,0 +1,12 @@
+diff --git "a/E:\\\350\247\206\351\242\221\\_flashnext\\experiments\\20261021-ornith122b\\_backups\\server.py.bak-pre-eos244-20261021-1435" "b/E:\\\350\247\206\351\242\221\\_flashnext\\experiments\\20261015-nemotron-on-strata\\PolyStrata\\serve\\server.py"
+index d1a55e7..99c67c2 100644
+--- "a/E:\\\350\247\206\351\242\221\\_flashnext\\experiments\\20261021-ornith122b\\_backups\\server.py.bak-pre-eos244-20261021-1435"
++++ "b/E:\\\350\247\206\351\242\221\\_flashnext\\experiments\\20261015-nemotron-on-strata\\PolyStrata\\serve\\server.py"
+@@ -758,6 +758,7 @@ def eos_ids_of(tokenizer) -> set:
+     im_end = tokenizer.encode(IM_END, parse_special=True)
+     if len(im_end) == 1:
+         ids.add(im_end[0])
++    ids.add(248044)   # T27: Ornith-1.5-122B's config.json eos_token_id; the GGUF names only 248046
+     return ids
+ 
+ 

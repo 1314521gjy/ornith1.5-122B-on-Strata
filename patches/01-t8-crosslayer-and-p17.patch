@@ -1,0 +1,151 @@
+diff --git "a/E:\\\350\247\206\351\242\221\\_flashnext\\experiments\\20261021-ornith122b\\_backups\\engine.cpp.bak-preT8-20261021-1152" "b/E:\\\350\247\206\351\242\221\\_flashnext\\experiments\\20261015-nemotron-on-strata\\PolyStrata\\src\\poly\\engine.cpp"
+index 08ddb7e..e168caf 100644
+--- "a/E:\\\350\247\206\351\242\221\\_flashnext\\experiments\\20261021-ornith122b\\_backups\\engine.cpp.bak-preT8-20261021-1152"
++++ "b/E:\\\350\247\206\351\242\221\\_flashnext\\experiments\\20261015-nemotron-on-strata\\PolyStrata\\src\\poly\\engine.cpp"
+@@ -3883,6 +3883,11 @@ bool Engine::moe_card(Layer& L, int il, int n) {
+ // stagers_ fill them, while the workers compute experts.
+ void Engine::stage(const Layer& L, const int32_t* experts, int m, void* stream, bool alone, uint8_t* base) {
+     staged_il_ = -1;   // whatever the buffer held
++    // T8/P7: every byte this call copies to VRAM, whoever asked for it (early copy, a round, a prefetch).
++    // One expert is slot_up()+gu_bytes+d_bytes = slot_down()+d_bytes (engine.hpp:139-140) - what actually moves;
++    // expert_slot_bytes() (engine.cpp:1575) prices that plus kTail and the block alignment.
++    ++stats_.stage_calls;
++    stats_.stage_bytes += (size_t) m * (L.slot_down() + L.d_bytes);
+     // STRATA_STAGE_RING2: the round buffer this copy fills (null: the one staging buffer, as always).
+     uint8_t* const dst = base ? base : stage_;
+     // the expert's own slot layout (slot_up()/slot_down()), not a gate-and-up width: a non-gated expert (Nemotron)
+@@ -4023,12 +4028,29 @@ void Engine::moe_rows(Layer& L, int il, int n) {
+         const char* e = std::getenv("STRATA_STAGE_RING2_CHECK");
+         return e && e[0] == '1' && e[1] == '\0';
+     }();
+-    const bool ring = stage2_ != nullptr && ahead && !shared_ahead_;
+-    if (prefetched_il_ != il) prefetched_il_ = -1;   // a prefetch for another layer is stale here
+-    const bool prefetched = ring && prefetched_il_ == il;
+-    const int rs = prefetched ? prefetched_slot_ : ring_slot_;   // the slot this call's round 0 reads
++    // T8/P2: read()'s several calls included. The hold below (P3/P4) keeps one copy a layer, so opening this
++    // here does not double the copy; with STRATA_STAGE_RING2=0 stage2_ is null and every line below is the old one.
++    const bool ring = stage2_ != nullptr && ahead;
++    // T8/P3: only a prefetch for a layer BEFORE this one is stale. A prefetch for il+1 is exactly what this
++    // layer's later calls must leave alone (`!= il` here would clear it and re-issue it, 3 copies a layer).
++    if (prefetched_il_ >= 0 && prefetched_il_ < il) prefetched_il_ = -1;
++    bool prefetched = ring && prefetched_il_ == il;
++    // T8/RING2-fix: only a prefetch this call consumes is checked against prefetched_n_; the hold branch reuses
++    // THIS layer's list, whose count prefetched_n_ no longer describes (the next layer's prefetch overwrote it).
++    const bool from_prefetch = prefetched;
++    int rs = prefetched ? prefetched_slot_ : ring_slot_;   // the slot this call's round 0 reads
++    if (prefetched)
++        prefetched_il_ = -1;
++    else if (ring && ring_hold_il_ == il) {   // a later call of this layer: the slot still holds its list
++        prefetched = true;
++        rs = ring_hold_slot_;
++        ++stats_.ring_reuse;
++    }
+     uint8_t* const rbase = ring ? slot_[rs] : nullptr;
+-    if (prefetched) prefetched_il_ = -1;
++    if (from_prefetch && n_ahead > 0 && n_ahead != prefetched_n_)
++        throw std::runtime_error("STRATA_STAGE_RING2: layer " + std::to_string(il) + " has " +
++                                 std::to_string(n_ahead) + " ahead experts, " + std::to_string(prefetched_n_) +
++                                 " were staged");
+     const bool mine = !ring && ahead && staged_il_ == il && (staged_ == L.ahead || 2 * route_ms_ < ahead_ms_);
+     const bool early = n_ahead > 0 && !mine && !prefetched;
+     if (early) {
+@@ -4047,7 +4069,12 @@ void Engine::moe_rows(Layer& L, int il, int n) {
+         // out already: how long before is not known until a call waits for it
+         route_ms_ = cudaEventQuery((cudaEvent_t) ev_) == cudaSuccess ? 0 : ahead_ms_;
+     }
+-    if (ring) ring_slot_ = 1 - rs;   // the slot the next call prefetches into: the one this call does not read
++    if (ring) {
++        ring_slot_ = 1 - rs;                      // the slot the next prefetch fills: the one this call does not read
++        ring_hold_il_ = n_ahead > 0 ? il : -1;    // later calls of this layer read rs, not a new copy
++        ring_hold_slot_ = rs;
++        prefetched_n_ = n_ahead;                  // the count the consumption check is against
++    }
+ 
+     const Clock::time_point t0 = Clock::now();
+     ck(cudaEventSynchronize((cudaEvent_t) ev_), "router");
+@@ -4497,20 +4524,24 @@ void Engine::moe_rows(Layer& L, int il, int n) {
+     if (n_cpu > 0) moe_add(L, n);
+     // STRATA_STAGE_RING2 (the design's 鈶?: the next layer's ahead list goes into the other buffer now, so its copy
+     // runs on up_ under this layer's kernels; the next call waits on that slot's event instead of copying it again.
+-    if (ring) {
++    if (ring && ring_hold_il_ == il) {   // this layer's own list is in place; issue its successor's copy once
+         int nxt = il + 1;
+         while (nxt < hi_ && !layers_[(size_t) nxt].moe) ++nxt;
+-        if (nxt < hi_ && batched(layers_[(size_t) nxt], n)) {
++        if (nxt < hi_ && prefetched_il_ != nxt && batched(layers_[(size_t) nxt], n)) {
+             Layer& N = layers_[(size_t) nxt];
+             plan_ahead(N, nxt);
+             const int na = (int) N.ahead.size();
+             if (na > 0) {
+                 const int s2 = ring_slot_;
++                if (s2 == rs)   // the whole design rests on this: the prefetch never writes the slot being read
++                    throw std::runtime_error("STRATA_STAGE_RING2: a prefetch would overwrite the slot it is for");
+                 ck(cudaStreamWaitEvent(cs(up_), (cudaEvent_t) ev_ring_free_[s2], 0), "expert staging");
+                 stage(N, N.ahead.data(), na, up_, false, slot_[s2]);
+                 ck(cudaEventRecord((cudaEvent_t) ev_ring_ahead_[s2], cs(up_)), "expert staging");
+                 prefetched_il_ = nxt;
+                 prefetched_slot_ = s2;
++                prefetched_n_ = na;
++                ++stats_.ring_prefetch;
+             }
+         }
+     }
+@@ -4934,6 +4965,15 @@ bool Engine::read(const int32_t* tokens, int n, const Mark* marks, int n_marks,
+         return (const std::function<bool(int, int)>*) &share;
+     };
+     if (n_calls == 1 || !mmq_ || all_cached() || n < opt_.stage_ahead) {
++        // T8/P17: this branch leaves through eval() and never reaches the clear-outs of the several-call branch
++        // below.  A ring hold or a prefetch left by the request before would survive into the next read, and
++        // resize_cache() (main.cpp:721-735) may have changed L.slot[] since: the slot would point at a list that
++        // no longer exists.  Cleared on the way in, so a return or a throw out of eval() leaves nothing to inherit.
++        if (ring2_) {
++            shared_ahead_ = false;
++            prefetched_il_ = -1;
++            ring_hold_il_ = -1;
++        }
+         turn = share_to(n_layer_);   // eval() takes the calls through the cards after this one
+         // On several cards the next one takes a call on a thread of its own, while this one runs the call after
+         // it.  Each card runs the calls as eval() does, in the same order.
+@@ -5015,6 +5055,10 @@ bool Engine::read(const int32_t* tokens, int n, const Mark* marks, int n_marks,
+     // a turn for each layer, and one for the model's output, which the draft block keeps a row of
+     const int turns = hi_ - lo_ + (drafting() ? 1 : 0);
+     shared_ahead_ = true;
++    // T8/P6: a prefetch left by the request before is not this read's - the cache may have been resized since
++    // (main.cpp:721-735 -> resize_cache), so the slot would point at a list that no longer exists.
++    prefetched_il_ = -1;
++    ring_hold_il_ = -1;
+     try {
+         for (int k = 0; k < turns; ++k) {
+             const int il = lo_ + k;
+@@ -5024,6 +5068,8 @@ bool Engine::read(const int32_t* tokens, int n, const Mark* marks, int n_marks,
+                 if (host) ck(cudaStreamSynchronize(cs(rs_)), "read");
+                 ck(cudaStreamSynchronize(cs(st_)), "read");
+                 shared_ahead_ = false;
++                prefetched_il_ = -1;
++                ring_hold_il_ = -1;
+                 r_ = r0;
+                 pos_ = pos0;
+                 return false;
+@@ -5076,11 +5122,22 @@ bool Engine::read(const int32_t* tokens, int n, const Mark* marks, int n_marks,
+     } catch (...) {
+         if (host) cudaStreamSynchronize(cs(rs_));
+         shared_ahead_ = false;
++        prefetched_il_ = -1;
++        ring_hold_il_ = -1;
+         r_ = r0;
+         pos_ = pos0;
+         throw;
+     }
+     shared_ahead_ = false;
++    // T8/P6: a prefetch left by the request before is not this read's - the cache may have been resized since
++    // (main.cpp:721-735 -> resize_cache), so the slot would point at a list that no longer exists.
++    prefetched_il_ = -1;
++    ring_hold_il_ = -1;
++    // T8/P7: printed only with the switch on, so that a run without it has the stderr it always had.
++    if (ring2_)
++        std::fprintf(stderr, "strata-poly: T8 ring: %lld prefetches, %lld hold reuses, staging %lld calls / %.2f GB\n",
++                     stats_.ring_prefetch, stats_.ring_reuse, stats_.stage_calls,
++                     (double) stats_.stage_bytes / (1024.0 * 1024.0 * 1024.0));
+     r_ = r0;
+     pos_ = pos0;
+     if (next_) {

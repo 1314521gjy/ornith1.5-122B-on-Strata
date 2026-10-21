@@ -1,0 +1,36 @@
+diff --git "a/E:\\\350\247\206\351\242\221\\_flashnext\\experiments\\20261021-ornith122b\\_backups\\engine.hpp.bak-preT8-20261021-1152" "b/E:\\\350\247\206\351\242\221\\_flashnext\\experiments\\20261015-nemotron-on-strata\\PolyStrata\\src\\poly\\engine.hpp"
+index 3bfdfe3..c69e5be 100644
+--- "a/E:\\\350\247\206\351\242\221\\_flashnext\\experiments\\20261021-ornith122b\\_backups\\engine.hpp.bak-preT8-20261021-1152"
++++ "b/E:\\\350\247\206\351\242\221\\_flashnext\\experiments\\20261015-nemotron-on-strata\\PolyStrata\\src\\poly\\engine.hpp"
+@@ -185,6 +185,10 @@ struct Stats {
+     // active_q8*512 + groups*2048 = the sidecar bytes a Stage C kernel would read for them.
+     long long r2d_uses = 0, r2d_active = 0, r2d_active_q8 = 0, r2d_groups = 0, r2d_bytes = 0;
+     double cpu_ms = 0, route_wait_ms = 0;
++    // T8/P7: the staging ledger, so "the copy happened once a layer, not three times" is a number and not a claim.
++    long long stage_calls = 0, ring_prefetch = 0, ring_reuse = 0;
++    size_t stage_bytes = 0;
++    double stage_wait_ms = 0;   ///< P7b only: the card's own time at the round-0 copy wait
+     // STRATA_SHARED_TIMING=1: wall time of the shared expert; shared_n1_ms/shared_n1 are the decode steps (n == 1),
+     // which is what "ms/token" is read from.  Default 0: never filled, nothing printed.
+     double shared_ms = 0, shared_n1_ms = 0;
+@@ -319,6 +323,7 @@ public:
+     const Stats& stats() const;
+     /// R56 (Stage B): whether STRATA_RELU2_DOWN=1 mapped the neuron-major down sidecar (never a compute path).
+     bool relu2_down_on() const { return r2d_base_ != nullptr; }
++    bool ring2() const { return ring2_; }   ///< T8: STRATA_STAGE_RING2's state, for a caller that prints its ledger
+     int expert_ff() const { return n_ff_exp_; }   ///< R56: a routed expert's hidden width (the sidecar's neurons)
+     /// R57c (D0): the pin budget's handover from the GGUF down half to the sidecar, at the answer's decode boundary.
+     bool relu2_pin_switch();
+@@ -745,6 +750,12 @@ protected:
+     int ring_slot_ = 0;        ///< the slot a ring call's round 0 reads when nothing was prefetched for it
+     int prefetched_il_ = -1;   ///< the layer whose ahead list sits in slot prefetched_slot_, or -1
+     int prefetched_slot_ = 0;
++    // T8/P1: the several-call read copies ahead once a layer and reads that one copy from every call of it.
++    // `prefetched_n_` is how many experts the copy in prefetched_slot_ took (checked when it is consumed);
++    // `ring_hold_*` say which slot holds THIS layer's list for its later calls (-1: none).
++    int prefetched_n_ = 0;     ///< how many experts that prefetch copied
++    int ring_hold_il_ = -1;    ///< the layer whose list slot ring_hold_slot_ holds for its later calls, or -1
++    int ring_hold_slot_ = -1;
+     void* ev_hr_ = nullptr;                       ///< marks the card's last read of h_r_ by draft_input()
+     int staged_il_ = -1;                          ///< the layer whose experts the buffer holds for its next call, or -1
+     std::vector<int32_t> staged_;                 ///< those experts, in the buffer's order: one round of the layer's

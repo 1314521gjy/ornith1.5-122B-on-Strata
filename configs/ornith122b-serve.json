@@ -1,0 +1,40 @@
+{
+ "exe": "E:\\视频\\_flashnext\\experiments\\20261015-nemotron-on-strata\\PolyStrata\\build-p3\\strata-poly.exe",
+ "args": [
+  "--model",
+  "E:\\strata-models\\Ornith-1.5-122B-AD-IQ3_S-IQ3_XXS\\Ornith-1.5-122B-AD-IQ3_S-IQ3_XXS-00001-of-00002.gguf",
+  "--max-context",
+  "32768",
+  "--prompt-batch",
+  "4800",
+  "--prompt-cache-every",
+  "0",
+  "--window",
+  "4",
+  "--lookup",
+  "3",
+  "--pcie-frac",
+  "0",
+  "--stage-mib",
+  "2048",
+  "--threads",
+  "16",
+  "--expert-profile",
+  "E:\\视频\\_flashnext\\experiments\\20261021-ornith122b\\profile\\expert-profile-ornith122b.txt"
+ ],
+ "env": {
+  "STRATA_PIN_ARENA_GIB": "44",
+  "STRATA_STAGE_RING2": "0",
+  "STRATA_PROFILE_DECODE_ONLY": "1",
+  "STRATA_AHEAD_EXACT": "1",
+  "STRATA_SCRATCH_TILE": "1",
+  "STRATA_PROFILE_AUTO_LEARN": "0",
+  "STRATA_MAX_PROMPT_BATCH": "8192"
+ },
+ "cwd": "E:\\视频\\_flashnext\\experiments\\20261015-nemotron-on-strata\\PolyStrata",
+ "tokenizer": "E:\\strata-models\\Ornith-1.5-122B-AD-IQ3_S-IQ3_XXS\\tok\\tokenizer",
+ "model_name": "ornith-1.5-122b-iq3_s",
+ "log": "E:\\视频\\_flashnext\\experiments\\20261021-ornith122b\\serve.log",
+ "host": "127.0.0.1",
+ "port": 8123
+}

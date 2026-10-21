@@ -1,0 +1,141 @@
+diff --git "a/E:\\\350\247\206\351\242\221\\_flashnext\\experiments\\20261021-ornith122b\\_backups\\main.cpp.bak-preT8-20261021-1152" "b/E:\\\350\247\206\351\242\221\\_flashnext\\experiments\\20261015-nemotron-on-strata\\PolyStrata\\src\\poly\\main.cpp"
+index da48898..da74283 100644
+--- "a/E:\\\350\247\206\351\242\221\\_flashnext\\experiments\\20261021-ornith122b\\_backups\\main.cpp.bak-preT8-20261021-1152"
++++ "b/E:\\\350\247\206\351\242\221\\_flashnext\\experiments\\20261015-nemotron-on-strata\\PolyStrata\\src\\poly\\main.cpp"
+@@ -56,6 +56,15 @@ using Clock = std::chrono::steady_clock;
+ 
+ double ms_since(Clock::time_point t) { return std::chrono::duration<double, std::milli>(Clock::now() - t).count(); }
+ 
++// STRATA_NAN_GUARD: a NaN in a row of logits makes the greedy pick return token 0 (<unk>) silently (most_likely()
++// finds no maximum).  The guard ends the run there, and generate_guarded() drops the cached state and reads the
++// request once more.  With the env unset nothing calls this function.
++bool row_has_nan(const float* logits, int n) {
++    for (int i = 0; i < n; ++i)
++        if (std::isnan(logits[i])) return true;
++    return false;
++}
++
+ // serve() saves the experts' use after its first answer and then after an answer when the last save is this long
+ // ago, and not only when it is told to quit: a server that is ended on Windows takes its engine with it at once.
+ // A save is a file of some 40 KB and a rename.
+@@ -502,7 +511,31 @@ struct Session {
+             repeats.reset();
+             repeats.append(history.data(), history.size());
+         }
++        // STRATA_NAN_GUARD=1: scan the row a pick reads; STRATA_NAN_INJECT=1 puts one NaN in the first such row
++        // (once a process) so the guard's recovery can be tested without waiting for a sporadic event.  Both are
++        // off by default: the block in pick() is skipped and no row is ever scanned.
++        static const bool nan_inject = [] {
++            const char* e = std::getenv("STRATA_NAN_INJECT");
++            return e && e[0] == '1' && e[1] == '\0';
++        }();
++        static const bool nan_guard = nan_inject || [] {   // the injection is the guard's own test case
++            const char* e = std::getenv("STRATA_NAN_GUARD");
++            return e && e[0] == '1' && e[1] == '\0';
++        }();
++        bool nan_hit = false;
++        static bool nan_injected = false;
+         const auto pick = [&](const float* logits) {
++            if (nan_guard) {
++                if (nan_inject && !nan_injected) {   // the test case: one NaN in the first row, once
++                    nan_injected = true;
++                    const_cast<float*>(logits)[0] = NAN;
++                }
++                if (row_has_nan(logits, engine.n_vocab())) {
++                    nan_hit = true;
++                    std::fprintf(stderr, "strata-poly: nan guard: logits row has NaN, dropping KV + rerun\n");
++                    return (int32_t) 0;
++                }
++            }
+             picked_from = logits;
+             if (follow && r.produced < (int64_t) follow->size()) return (*follow)[(size_t) r.produced];
+             return (int32_t) sampler.pick(logits, engine.n_vocab(), s, history, rng);
+@@ -525,7 +558,12 @@ struct Session {
+             int dump_n = 0, dump_round = 0;
+             bool dump_now = false;
+             int32_t t = pick(engine.logits());   // picked, and not shown yet
+-            while (show(t)) {
++            if (nan_hit) {                       // a non-finite row: end the run; generate_guarded() retries it
++                r.finish = "nan";
++                r.decode_ms = ms_since(t0);
++                return r;
++            }
++            while (!nan_hit && show(t)) {
+                 // t goes into the model now, and with it guesses at what follows when there are any that pay
+                 const Clock::time_point round = Clock::now();
+                 const bool room = engine.pos() + most <= engine.max_context();
+@@ -624,7 +662,7 @@ struct Session {
+                 int right = 0;
+                 bool more = true;
+                 t = pick(engine.logits_of(0));
+-                while (right < use.t - 1 && t == w[right + 1] && (more = show(t))) t = pick(engine.logits_of(++right));
++                while (!nan_hit && right < use.t - 1 && t == w[right + 1] && (more = show(t))) t = pick(engine.logits_of(++right));
+                 engine.keep(right + 1);
+                 kept.read(w, right + 1);
+                 r.guessed += use.t - 1;
+@@ -641,9 +679,36 @@ struct Session {
+                 if (!more) break;
+             }
+         }
++        if (nan_hit) r.finish = "nan";
+         r.decode_ms = ms_since(t0);
+         return r;
+     }
++
++    // The guard's recovery: the run ended on a non-finite row; drop the cached state and read the request once
++    // more from token 0, dropping the tokens the first run had already shown.
++    template<class OnToken, class OnProgress>
++    Result generate_guarded(const std::vector<int32_t>& ids, const Pictures& pictures, int32_t pad, int64_t turn_at,
++                            int64_t max_new, const Sampling& s, const std::atomic<bool>& stop, OnToken on_token,
++                            OnProgress on_progress) {
++        Result r = generate(ids, pictures, pad, turn_at, max_new, s, stop, on_token, on_progress);
++        if (std::strcmp(r.finish, "nan") != 0) return r;
++        if (stop.load()) return r;
++        const int64_t shown = r.produced;
++        kept.drop();
++        engine.reset();
++        repeats.reset();
++        int64_t skip = shown;
++        const auto later = [&](int32_t t) {
++            if (skip > 0) { --skip; return; }
++            on_token(t);
++        };
++        r = generate(ids, pictures, pad, turn_at, max_new, s, stop, later, on_progress);
++        if (std::strcmp(r.finish, "nan") == 0) {
++            std::fprintf(stderr, "ERR nan guard: non-finite logits again after the rerun\n");
++            r.finish = "error";
++        }
++        return r;
++    }
+ };
+ 
+ // GEN <max_new> [key=value ...] <id,id,...>, or GENI with the file of the prompt's pictures ahead of the ids and
+@@ -790,7 +855,7 @@ int serve(Session& ss) {
+                 std::fprintf(stderr, "strata-poly: the expert cache %d -> %d experts (%.2f GiB) for the VRAM free "
+                                      "now, %lld MiB left\n",
+                              had, engine.cached_experts(), engine.cached_gib(), (long long) engine.vram_free_mib());
+-            r = ss.generate(
++            r = ss.generate_guarded(
+                 ids, pictures, pad, turn_at, max_new, s, lines.stop,
+                 [](int32_t t) {
+                     std::printf("T %d\n", (int) t);
+@@ -860,7 +925,7 @@ int once(Session& ss, const std::vector<int32_t>& ids, const Pictures& pictures,
+          const Sampling& s, int top_probs) {
+     std::atomic<bool> stop{false};
+     std::string out;
+-    const Session::Result r = ss.generate(
++    const Session::Result r = ss.generate_guarded(
+         ids, pictures, pad, -1, max_new, s, stop,
+         [&](int32_t t) {
+             if (top_probs > 0) print_top(ss.picked_from, ss.engine.n_vocab(), top_probs);
+@@ -884,6 +949,10 @@ int once(Session& ss, const std::vector<int32_t>& ids, const Pictures& pictures,
+                  (unsigned long long) ss.engine.pin_dmas(),
+                  ss.engine.pin_dmas() ? (double) ss.engine.pin_dma_bytes() / (double) ss.engine.pin_dmas() / (1 << 20)
+                                       : 0.0);
++    if (ss.engine.ring2())   // see Engine::ring2(): the switch's state
++        std::fprintf(stderr, "T8 staging ledger: %lld stage() calls / %.2f GB, %lld ring prefetches, %lld hold reuses\n",
++                     (long long) st.stage_calls, (double) st.stage_bytes / (double) (1 << 30),
++                     (long long) st.ring_prefetch, (long long) st.ring_reuse);
+     std::fprintf(stderr, "copy ledger: fill %llu / %.2f MB; prefill staging %llu / %.2f GB; swap %llu / %.2f GB\n",
+                  (unsigned long long) ss.engine.fill_dmas(), (double) ss.engine.fill_dma_bytes() / (1 << 20),
+                  (unsigned long long) ss.engine.pin_dmas(), (double) ss.engine.pin_dma_bytes() / (double) (1 << 30),
