@@ -7,9 +7,20 @@
 |---|---|---|---|
 | **prefill** | 851.3 tok/s | **2306.5 tok/s** | **+171%** |
 | **8K TTFT** | 4.66 s | **2.079 s** | **−55%** |
-| **decode**（安全档） | 47.6 tok/s | **51.4 tok/s** | +1~7% |
-| **decode**（turbo 有损档） | — | **54.8~56.2 tok/s** | **+15~18%** |
+| **decode**（安全档） | 47.6 tok/s | **48.7–51.4 tok/s** | +1~7% |
+| **decode**（turbo 有损档） | — | **54.8–56.2 tok/s** | **+15~18%** |
 | 加载 | 12.1 s | 9.9 s | −18% |
+
+## 🚀 想直接部署？看 [DEPLOY.md](DEPLOY.md)
+
+那里有完整的闭环：**模型获取与 sha256 校验 → 编译 → 一键启动脚本 → 健康检查期望值 → 踩过的 10 个坑**。
+本仓库自带 **tokenizer**（从 GGUF 导出，不要另取）与 **专家画像表**（10,425 行），拿到就能跑。
+
+```powershell
+# 最短路径
+.\scripts\start-safe.ps1 -Model <第一片.gguf> -Exe <strata-poly.exe> `
+                         -Profile .\profile\expert-profile-ornith122b.txt -Tokenizer .\tokenizer
+```
 
 ## 收益从哪来（三块，**全部零改码**）
 
@@ -24,14 +35,34 @@
 ## 仓库内容
 
 ```
+README.md                本件
+DEPLOY.md                ★ 部署指南（模型/编译/启动/健康检查/坑）
 src/poly/engine.hpp      改动后完整源码（T8 双缓冲字段 + 第 17 落点）
-src/poly/engine.cpp      改动后完整源码（T8 + 落点修复）
-src/poly/main.cpp        改动后完整源码（T8 入口/出口 + NaN 守卫 + 注入钩子）
+src/poly/engine.cpp      改动后完整源码
+src/poly/main.cpp        改动后完整源码（T8 + NaN 守卫 + 注入钩子）
 serve/server.py          改动后完整源码（eos 248044）
 patches/                 四个相对上游的 unified diff（共 340 行）
 configs/                 安全档 / turbo 有损档 的 run config
-benchmark/performance.md 完整读数表、判否清单（20+ 条，带判据）、方法论
+scripts/                 start-safe.ps1 / start-turbo.ps1（一键启动）
+profile/                 专家画像表（10,425 行，103,504 B）
+tokenizer/               tokenizer（从 GGUF 导出；serve 必需）
+benchmark/performance.md 性能读数 + 20+ 条判否（带判据）+ 三条方法论 + 五条口径坑
+benchmark/intel-test.md  智力测试（28 题 / 32 请求）逐题明细
 ```
+
+## 智力测试（验"有没有退化"）
+
+| 维度 | 结果 |
+|---|---|
+| **算数 15**（5×3 长度难度矩阵） | **15/15 全对**，5 道干扰题全部没上当 |
+| **对话 12** | 技术通过（无 `<unk>`、无空答案、`reasoning_len` 全 >0） |
+| **工具 4** | 3/4 触发 native `tool_calls`、args 合法；第 4 条是"有副作用工具先要授权"的安全行为 |
+| **代码-SVG 1** | 四条全过（合法 XML、闭合、有 `@keyframes`、`finish=stop`） |
+
+**⇒ 该仪器集上未见智力退化**（28 题不够做统计判据；本机《质量闸门》要求 ≥400 题才能判小退化）。
+明细见 [benchmark/intel-test.md](benchmark/intel-test.md)。
+
+**唯一硬伤：身份污染。** 中文身份题 **3/3 答「我是 Claude，由 Anthropic 开发」**、英文 **2/3 答「Zhipu AI / GLM-4.5」**、1 次回避，且**跨会话不一致** —— 这是**模型权重里的训练数据污染**（接线侧 tokenizer/template/eos/`<unk>` 全部验过无误），**要重训或换权重才能修**。
 
 ## 三个补丁的结局（诚实记录）
 
@@ -43,27 +74,8 @@ benchmark/performance.md 完整读数表、判否清单（20+ 条，带判据）
 
 ## 两个"看起来像智力退化、其实是配置"的坑
 
-1. **`max_tokens` 被 thinking 吃光**：`usage` 里 **thinking 计入 `completion`**，且**没有 `reasoning_tokens` 字段**。开思考时 `max_tokens` 给小了（如 1024）会出现 **content 0 字 + `finish=length`** —— 看起来像"模型不会答"，实际是预算不够。**修法：`max_tokens` ≥ 4096**。
-2. **"身份混乱"是模型权重，不是引擎**：身份题问三次，中文稳定答「我是 Claude，由 Anthropic 开发」、英文 2/3 答「Zhipu AI / GLM-4.5」—— 这是**微调数据里的身份污染**，接线侧（tokenizer / template / eos / `<unk>`）全部验过无误。**判身份只能看一致性，不能看"说了哪个名字"**（`qwen3_5_moe` 的基座本来就是 Qwen3.5，"通义千问"是它的真名）。
-
-## 环境与复现
-
-```powershell
-# 1) 引擎（CUDA 13.3 编译，DLL 在 bin\x64 不在 bin）
-$env:PATH = "<cuda-13.3>\bin\x64;$env:PATH"
-
-# 2) 安全档（默认）
-$cfg = configs/ornith122b-serve.json
-# args: --prompt-batch 4800 --prompt-cache-every 0 --window 4 --lookup 3
-#       --pcie-frac 0 --stage-mib 2048 --threads 16 --max-context 32768
-# env : STRATA_PIN_ARENA_GIB=44  STRATA_STAGE_RING2=0  STRATA_MAX_PROMPT_BATCH=8192
-#       STRATA_PROFILE_DECODE_ONLY=1  STRATA_AHEAD_EXACT=1  STRATA_SCRATCH_TILE=1
-
-# 3) 位置：`STRATA_MAX_PROMPT_BATCH` 必须 8192（4096 = 空转，源码只在 >4096 时抬上限）
-# 4) 禁：STRATA_DET_WINDOW（强制满仓投机，会把 +6% 变成 −24%）
-```
-
-**turbo 档**（有损）：在安全档基础上加 `STRATA_ROUTE_TAIL_SKIP=7` —— decode **+18%**，代价是**每 token 跳过约 14.2 次专家使用**、输出会变。**默认不要开**。
+1. **`max_tokens` 被 thinking 吃光**：`usage` 里 **thinking 计入 `completion`**、**没有 `reasoning_tokens` 字段**。开思考时给 1024 会出现 **content 0 字 + `finish=length`** —— 看起来像"模型不会答"，实际是预算不够。**修法：`max_tokens` ≥ 4096。**
+2. **"身份混乱"是模型权重，不是引擎**（见上）。
 
 ## 数据口径（重要）
 
